@@ -6,52 +6,64 @@ import re
 from pypdf import PdfReader
 import pandas as pd
 
-# --- [에이전트 팀의 규칙 엔진] ---
-def calculate_multiplier(text):
-    # 1. "1면 X페이지" 규칙 (나누기)
-    div_match = re.search(r'1면\s*(\d+)페이지', text)
-    if div_match:
-        return 1 / int(div_match.group(1)), f"1면 {div_match.group(1)}페이지(÷)"
+# --- [에이전트 규칙 엔진: 더 정교한 패턴 매칭] ---
+def get_multiplier(text):
+    text = text.lower().replace(" ", "") # 공백 제거 및 소문자화로 오차 감소
+    
+    # 1. 나누기 규칙 (1면 2페이지, 한면에4페이지, 4up 등)
+    div_patterns = [r'(\d+)up', r'1면(\d+)페이지', r'한면에(\d+)페이지']
+    for p in div_patterns:
+        match = re.search(p, text)
+        if match:
+            val = int(match.group(1))
+            return 1 / val, f"{val}분할(÷{val})"
 
-    # 2. "X장" 규칙 (곱하기)
+    # 2. 곱하기 규칙 (X장, X회)
     mul_match = re.search(r'(\d+)장', text)
     if mul_match:
-        return float(mul_match.group(1)), f"{mul_match.group(1)}장(×)"
+        val = int(mul_match.group(1))
+        return float(val), f"{val}장(×{val})"
     
-    return 1.0, "기본(1:1)"
+    return 1.0, "기본"
 
 # --- [웹 화면 설계] ---
-st.set_page_config(page_title="AI 견적 팀", layout="wide")
-st.title("📂 무결점 AI 견적 에이전트 팀 (V2.1)")
-st.write("규칙: '1면 2페이지'는 0.5배, '3장'은 3배로 자동 계산하며 '비닐' 파일을 별도 체크합니다.")
+st.set_page_config(page_title="AI 견적 마스터 팀", layout="wide")
+st.title("📂 사내 업무 자동화: 견적 에이전트 팀 V3.0")
+st.markdown("#### 1. 출력X 제외 | 2. 페이지 분할/배수 적용 | 3. 폴더별 상세 분류 (컬러/색지/비닐)")
 
-uploaded_zip = st.file_uploader("작업 폴더(ZIP)를 올려주세요", type="zip")
+uploaded_zip = st.file_uploader("작업 폴더(ZIP)를 선택하세요", type="zip")
 
 if uploaded_zip:
-    results = []
-    vinyl_count = 0
-    
+    # 폴더별로 결과를 담을 사전 (Dictionary)
+    folder_data = {}
+
     with zipfile.ZipFile(uploaded_zip, 'r') as z:
         for f in z.namelist():
+            # PDF만 처리하며, 맥용 시스템 파일이나 디렉토리 자체는 제외
             if f.startswith('__MACOSX') or not f.lower().endswith('.pdf'): continue
             
             filename = os.path.basename(f)
-            foldername = os.path.dirname(f)
+            foldername = os.path.dirname(f) if os.path.dirname(f) else "루트폴더"
             
-            # 에이전트 1: 폴더명과 파일명 우선 검토
-            # 폴더명에서 먼저 규칙을 찾고, 파일명에 규칙이 있으면 파일명 규칙을 우선합니다.
-            multiplier, rule_name = calculate_multiplier(foldername)
-            file_multiplier, file_rule_name = calculate_multiplier(filename)
+            # [규칙 1] 출력X 항목은 계산에서 완전 제외
+            if "출력x" in filename.lower(): continue
             
-            if file_multiplier != 1.0: # 파일명에 규칙이 있으면 덮어쓰기
-                multiplier = file_multiplier
-                rule_name = file_rule_name
+            # [규칙 2] 페이지 배수 계산 (파일명 우선, 없으면 폴더명)
+            multiplier, rule_name = get_multiplier(filename)
+            if multiplier == 1.0:
+                multiplier, rule_name = get_multiplier(foldername)
 
-            # 에이전트 2: 비닐 단어 체크
-            is_vinyl = "비닐" in filename
-            if is_vinyl: vinyl_count += 1
-            
-            # 에이전트 3: PDF 페이지 추출 및 계산
+            # [규칙 3] 분류 에이전트 (카테고리 결정)
+            category = "일반(흑백)"
+            fn_low = filename.lower()
+            if any(k in fn_low for k in ["칼라", "컬러", "color"]):
+                category = "컬러"
+            elif any(k in fn_low for k in ["색지", "색간지"]):
+                category = "색지/간지"
+            elif "비닐" in fn_low:
+                category = "비닐내지"
+
+            # [규칙 4] 페이지 추출
             try:
                 with z.open(f) as pdf_file:
                     reader = PdfReader(io.BytesIO(pdf_file.read()))
@@ -60,26 +72,29 @@ if uploaded_zip:
             except:
                 raw_pages, final_pages = 0, 0
 
-            results.append({
-                "폴더명": foldername,
-                "파일명": filename,
-                "물리 페이지": raw_pages,
-                "적용 규칙": rule_name,
-                "최종 계산": final_pages,
-                "비닐 여부": "O" if is_vinyl else "X"
-            })
+            # 폴더별 데이터 합산
+            if foldername not in folder_data:
+                folder_data[foldername] = {"일반(흑백)": 0, "컬러": 0, "색지/간지": 0, "비닐내지": 0, "파일수": 0}
+            
+            folder_data[foldername][category] += final_pages
+            folder_data[foldername]["파일수"] += 1
 
-    # 결과 요약
-    df = pd.DataFrame(results)
-    st.divider()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("총 파일", f"{len(df)}개")
-    c2.metric("비닐 포함", f"{vinyl_count}개")
-    c3.metric("최종 페이지 합계", f"{df['최종 계산'].sum()}p")
+    # 데이터프레임 변환 및 출력
+    if folder_data:
+        df = pd.DataFrame.from_dict(folder_data, orient='index').reset_index()
+        df.columns = ["폴더명", "일반(흑백)", "컬러", "색지/간지", "비닐내지", "파일수"]
+        
+        st.divider()
+        st.subheader("📊 폴더별 상세 견적 리포트")
+        st.dataframe(df, use_container_width=True)
 
-    st.table(df) # 상세 내역 출력
+        # 전체 합계 계산
+        total_sum = df.sum(numeric_only=True)
+        st.info(f"✅ **전체 합계** | 흑백: {total_sum['일반(흑백)']}p, 컬러: {total_sum['컬러']}p, 색지: {total_sum['색지/간지']}p, 비닐: {total_sum['비닐내지']}p")
 
-    # 엑셀 다운로드
-    output = io.BytesIO()
-    df.to_excel(output, index=False, engine='openpyxl')
-    st.download_button("📊 엑셀 견적서 다운로드", data=output.getvalue(), file_name="견적결과.xlsx")
+        # 엑셀 다운로드
+        output = io.BytesIO()
+        df.to_excel(output, index=False, engine='openpyxl')
+        st.download_button("📂 폴더별 견적 엑셀 받기", data=output.getvalue(), file_name="최종_폴더별_견적.xlsx")
+    else:
+        st.warning("분석할 수 있는 PDF 파일이 없습니다. (출력X 제외됨)")
