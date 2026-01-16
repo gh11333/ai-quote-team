@@ -2,5 +2,4 @@ streamlit
 pypdf
 pandas
 openpyxl
-python-docx
 python-pptx
