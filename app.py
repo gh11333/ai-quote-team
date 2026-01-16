@@ -14,7 +14,7 @@ try:
 except:
     HAS_PPTX = False
 
-# --- [에이전트 지능: 전략 지휘 로직 V10.0] ---
+# --- [에이전트 지능: 전략 지휘 로직 V11.0] ---
 def get_multiplier(text):
     if not text: return 1.0, 1
     text = text.lower().replace(" ", "")
@@ -57,8 +57,8 @@ def analyze_file(filename, foldername, folder_instr):
     return res
 
 # --- [메인 시스템] ---
-st.set_page_config(page_title="사내 견적 에이전트 V10.0", layout="wide")
-st.title("📂 무결점 사내 견적 에이전트 팀 (V10.0 - 지시서 상속 및 자재 스케일링)")
+st.set_page_config(page_title="사내 견적 에이전트 V11.0", layout="wide")
+st.title("🚀 무결점 사내 견적 에이전트 팀 (V11.0 - 지시서 완전 상속)")
 
 uploaded_zip = st.file_uploader("ZIP 파일을 업로드하세요", type="zip")
 
@@ -70,20 +70,24 @@ if uploaded_zip:
 
     try:
         with zipfile.ZipFile(uploaded_zip, 'r') as z:
-            all_paths = z.namelist()
-            # 1. 사전 작업: 폴더별 텍스트 지시서 내용 통합 수집
+            all_paths = [p for p in z.namelist() if not p.startswith('__MACOSX')]
+            
+            # 1. 지시서 수집 엔진 (파일명 + 내용 통합)
             folder_notes = {}
             for p in all_paths:
                 if p.lower().endswith('.txt'):
                     foldername = os.path.dirname(p)
+                    # 텍스트 파일의 '이름' 자체가 지시사항인 경우 포함
+                    instr_from_name = os.path.basename(p)
+                    folder_notes[foldername] = folder_notes.get(foldername, "") + " " + instr_from_name
                     try:
                         with z.open(p) as tf:
                             content = tf.read().decode('utf-8', errors='ignore')
-                            folder_notes[foldername] = folder_notes.get(foldername, "") + " " + content
+                            folder_notes[foldername] += " " + content
                     except: pass
 
-            # 2. 본 작업 시작
-            valid_files = [f for f in all_paths if not f.startswith('__MACOSX') and not f.endswith('/') and not f.lower().endswith(('.doc', '.docx'))]
+            # 2. 파일 분석 및 정산
+            valid_files = [f for f in all_paths if not f.endswith('/') and not f.lower().endswith(('.doc', '.docx', '.txt'))]
             
             for f in valid_files:
                 filename = os.path.basename(f)
@@ -97,11 +101,10 @@ if uploaded_zip:
 
                 if "출력x" in filename.lower(): continue
 
-                # 지시서 상속 엔진
                 instr = folder_notes.get(foldername, "")
                 info = analyze_file(filename, foldername, instr)
                 
-                # 배수 결정 (우선순위: 파일명 > 지시서 > 폴더명)
+                # 배수 결정 로직 (파일명 > 지시서 > 폴더명)
                 f_div, f_mul = get_multiplier(filename)
                 txt_div, txt_mul = get_multiplier(instr)
                 fold_div, fold_mul = get_multiplier(foldername)
@@ -112,18 +115,19 @@ if uploaded_zip:
                 ext = os.path.splitext(f)[1].lower()
                 p_bw, p_color, m_divider, m_vinyl, m_usb, m_special = 0, 0, 0, 0, 0, 0
 
+                # [출력물 판별]
+                is_printed = False
+                if ext in ['.pdf', '.pptx'] and not info["is_binder"] and not info["is_toc"] and not info["is_divider"] and not info["is_usb"]:
+                    is_printed = True
+
                 # [USB 정산 - 폴더당 1개]
                 if info["is_usb"] and foldername not in usb_done_folders:
                     m_usb = 1
                     usb_done_folders.add(foldername)
 
-                # [색간지 정산 - 파일당 1개 로직 포함]
+                # [부자재 정산]
                 if info["is_divider"]:
-                    m_divider = final_mul # 기본은 부수만큼
-                    if info["is_divider_each"]: # '사이사이' 등 키워드 있으면 강제 1배 (파일당 1개씩 추가될 예정)
-                        m_divider = 1
-
-                # [비닐 정산 - 그룹핑]
+                    m_divider = 1 if info["is_divider_each"] else final_mul
                 if info["is_vinyl"]:
                     prefix = get_prefix(filename)
                     if info["is_group_vinyl"] and prefix:
@@ -133,14 +137,11 @@ if uploaded_zip:
                             vinyl_groups_done[top_folder].add(group_key)
                     else:
                         m_vinyl = final_mul if any(k in filename for k in ['각', '각각']) else f_mul
-
                 if info["is_special"]: m_special = final_mul
 
-                # [페이지 계산 및 총파일수 집계]
+                # [페이지 계산]
                 raw_p = 0
-                is_counted_file = False
-                # 인쇄 가능한 파일이면서 바인더/TOC/USB/간지 전용이 아닐 때
-                if ext in ['.pdf', '.pptx'] and not info["is_binder"] and not info["is_toc"] and not info["is_divider"] and not info["is_usb"]:
+                if is_printed:
                     try:
                         with z.open(f) as fd:
                             f_stream = io.BytesIO(fd.read())
@@ -150,7 +151,6 @@ if uploaded_zip:
                             p_val = math.ceil(raw_p * final_div) * final_mul
                             if info["is_color"]: p_color = p_val
                             else: p_bw = p_val
-                            if p_val > 0: is_counted_file = True
                     except: pass
 
                 # 합산
@@ -160,27 +160,26 @@ if uploaded_zip:
                 summary[top_folder]["비닐"] += m_vinyl
                 summary[top_folder]["USB or CD"] += m_usb
                 summary[top_folder]["특수"] += m_special
-                if is_counted_file: summary[top_folder]["총파일수"] += 1
+                if is_printed and (p_bw > 0 or p_color > 0): summary[top_folder]["총파일수"] += 1
 
                 detailed_log.append({
                     "폴더": top_folder, "파일명": filename, "원본P": raw_p, "배수": f"{final_div}x{final_mul}",
-                    "흑백": p_bw, "컬러": p_color, "색간지": m_divider, "비닐": m_vinyl, "USB": m_usb, "실출력": is_counted_file
+                    "흑백": p_bw, "컬러": p_color, "색간지": m_divider, "비닐": m_vinyl, "인쇄여부": is_printed
                 })
 
-        # 화면 출력
-        st.subheader("📊 1. 최상위 폴더별 견적 요약 리포트 (V10.0)")
+        st.subheader("📊 1. 최상위 폴더별 견적 요약 리포트 (V11.0)")
         sum_df = pd.DataFrame.from_dict(summary, orient='index')
         cols = ["흑백", "컬러", "색간지", "비닐", "USB or CD", "특수", "총파일수"]
         st.dataframe(sum_df[cols], use_container_width=True)
         
-        st.subheader("🔍 2. 상세 계산 근거 (검증용)")
+        st.subheader("🔍 2. 상세 계산 근거")
         st.dataframe(pd.DataFrame(detailed_log), use_container_width=True)
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             sum_df[cols].to_excel(writer, sheet_name='최종요약')
             pd.DataFrame(detailed_log).to_excel(writer, sheet_name='상세근거')
-        st.download_button("📂 V10.0 최종 견적서 다운로드", data=output.getvalue(), file_name="최종_견적_리포트_V10.xlsx")
+        st.download_button("📂 V11.0 최종 견적서 다운로드", data=output.getvalue(), file_name="최종_견적_리포트_V11.xlsx")
 
     except Exception as e:
         st.error(f"시스템 오류 발생: {e}")
