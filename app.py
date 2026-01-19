@@ -144,4 +144,33 @@ if uploaded_zip:
                         with z.open(p) as f_in:
                             f_stream = io.BytesIO(f_in.read())
                             if p.lower().endswith('.pdf'):
-                                raw_p
+                                raw_p = len(PdfReader(f_stream).pages)
+                            elif p.lower().endswith('.pptx') and Presentation:
+                                raw_p = len(Presentation(f_stream).slides)
+                        final_p = math.ceil(raw_p * final_div) * final_mul
+                        if cat == "컬러": p_color = final_p
+                        else: p_bw = final_p
+                        summary[top_folder]["총파일수"] += 1
+                    except: pass
+
+                # 결과 집합
+                summary[top_folder]["흑백"] += p_bw
+                summary[top_folder]["컬러"] += p_color
+                summary[top_folder]["비닐"] += m_vinyl
+                summary[top_folder]["색간지"] += m_divider
+                if cat == "TOC": summary[top_folder]["TOC"] += final_mul
+                if cat == "바인더": summary[top_folder]["바인더"] += final_mul
+
+                detailed_log.append({"폴더": top_folder, "파일명": filename, "분류": cat, "계산": f"{final_div}up x {final_mul}부", "최종P": final_p, "비닐": m_vinyl})
+
+        st.subheader("📊 V38.0 최종 정산 리포트")
+        st.dataframe(pd.DataFrame.from_dict(summary, orient='index'), use_container_width=True)
+        
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            pd.DataFrame.from_dict(summary, orient='index').to_excel(writer, sheet_name='요약')
+            pd.DataFrame(detailed_log).to_excel(writer, sheet_name='상세')
+        st.download_button("📂 정산서 다운로드", data=output.getvalue(), file_name="최종_정산_V38.xlsx")
+
+    except Exception as e:
+        st.error(f"오류: {e}")
