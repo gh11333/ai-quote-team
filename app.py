@@ -1,78 +1,148 @@
 import streamlit as st
-import zipfile, io, os
-import pandas as pd
+import zipfile
+import os
+import io
+import re
+import math
 from pypdf import PdfReader
+import pandas as pd
 
-from agents.expression_agent import *
-from agents.context_agent import detect_context
-from agents.page_agent import calculate_pages
-from agents.material_agent import extract_folder_materials
-from agents.aggregate_agent import aggregate
+# ===============================
+# [1] 정규식 유틸
+# ===============================
 
-st.set_page_config(layout="wide")
-st.title("📦 인쇄 자동 정산 Agent Team (안정판)")
+def extract_pages_per_sheet(text: str) -> int | None:
+    patterns = [
+        r'(\d+)\s*up',
+        r'한면\s*(\d+)\s*페이지',
+        r'한면(\d+)페이지',
+        r'(\d+)\s*페이지\s*출력',
+    ]
+    for p in patterns:
+        m = re.search(p, text)
+        if m:
+            return int(m.group(1))
+    return None
 
-uploaded = st.file_uploader("ZIP 업로드", type="zip")
+def extract_copies(text: str) -> int | None:
+    m = re.search(r'(\d+)\s*(부|장)', text)
+    if m:
+        return int(m.group(1))
+    return None
 
-if uploaded:
-    results = []
-    folder_files, folder_txts = {}, {}
+def is_color(text: str) -> bool:
+    return any(k in text for k in ['컬러', '칼라', 'color'])
 
-    with zipfile.ZipFile(uploaded) as z:
-        for p in z.namelist():
-            if p.startswith("__MACOSX") or p.endswith("/"):
+# ===============================
+# [2] Streamlit 기본
+# ===============================
+
+st.set_page_config(page_title="AI 견적 엔진 v1", layout="wide")
+st.title("📦 ZIP 인쇄 자동 정산기 (정확도 우선 v1)")
+
+uploaded_zip = st.file_uploader("ZIP 파일 업로드", type="zip")
+
+# ===============================
+# [3] ZIP 처리
+# ===============================
+
+if uploaded_zip:
+    with zipfile.ZipFile(uploaded_zip) as z:
+        all_files = [f for f in z.namelist() if not f.endswith('/')]
+
+        # --------------------------------
+        # 3-1. 폴더별 txt 내용 수집
+        # --------------------------------
+        folder_txt = {}
+
+        for f in all_files:
+            if f.lower().endswith('.txt'):
+                folder = os.path.dirname(f)
+                with z.open(f) as tf:
+                    content = tf.read().decode('utf-8', errors='ignore').lower()
+                    folder_txt.setdefault(folder, "")
+                    folder_txt[folder] += " " + content
+
+        # 상위 폴더 상속용 함수
+        def collect_txt_context(folder):
+            texts = []
+            while True:
+                if folder in folder_txt:
+                    texts.append(folder_txt[folder])
+                if not folder or folder == ".":
+                    break
+                folder = os.path.dirname(folder)
+            return " ".join(texts)
+
+        # --------------------------------
+        # 3-2. PDF 계산
+        # --------------------------------
+        results = []
+
+        for f in all_files:
+            if not f.lower().endswith('.pdf'):
                 continue
 
-            folder = p.split("/")[0]
-            folder_files.setdefault(folder, [])
-            folder_txts.setdefault(folder, [])
+            folder = os.path.dirname(f)
+            filename = os.path.basename(f)
 
-            if p.lower().endswith(".txt"):
-                folder_txts[folder].append(p)
-            else:
-                folder_files[folder].append(p)
-
-        # 자재 먼저 계산
-        folder_materials = {}
-        for folder in folder_files:
-            folder_materials[folder] = extract_folder_materials(
-                folder,
-                folder_files[folder],
-                folder_txts.get(folder, [])
+            # 컨텍스트 합치기 (🔥 핵심)
+            context = (
+                filename.lower()
+                + " "
+                + collect_txt_context(folder)
             )
 
-        # 인쇄 계산
-        for p in z.namelist():
-            if not p.lower().endswith(".pdf"):
-                continue
+            # 인쇄 조건 추출
+            pps = extract_pages_per_sheet(context) or 1
+            copies = extract_copies(context) or 1
+            color = "컬러" if is_color(context) else "흑백"
 
-            folder = p.split("/")[0]
-            filename = os.path.basename(p)
-            text = p.lower()
+            # 페이지 수
+            with z.open(f) as pdf_file:
+                reader = PdfReader(io.BytesIO(pdf_file.read()))
+                raw_pages = len(reader.pages)
 
-            ctx = detect_context(text)
-            if ctx.get("ignore"):
-                continue
-
-            with z.open(p) as f:
-                raw_pages = len(PdfReader(io.BytesIO(f.read())).pages)
-
-            pps = extract_pages_per_sheet(text)
-            copies = extract_copies(text)
-            final_pages, detail = calculate_pages(raw_pages, pps, copies)
+            final_pages = math.ceil(raw_pages / pps) * copies
 
             results.append({
-                "folder": folder,
-                "file": filename,
-                "print_type": ctx["print_type"],
-                "pages": final_pages,
-                "detail": detail
+                "폴더": folder if folder else "ROOT",
+                "파일명": filename,
+                "구분": color,
+                "원본페이지": raw_pages,
+                "한면": pps,
+                "부수": copies,
+                "최종페이지": final_pages
             })
 
-    summary = aggregate(results, folder_materials)
+    # ===============================
+    # [4] 결과 출력
+    # ===============================
 
-    st.subheader("📊 요약")
-    st.dataframe(pd.DataFrame(summary).T)
+    df = pd.DataFrame(results)
 
-    st.subheader("🔍 상세")
-    st.dataframe(pd.DataFrame(results))
+    summary = (
+        df.groupby(["폴더", "구분"])["최종페이지"]
+        .sum()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+
+    st.subheader("📊 폴더별 요약")
+    st.dataframe(summary, use_container_width=True)
+
+    st.subheader("📄 상세 내역")
+    st.dataframe(df, use_container_width=True)
+
+    # 엑셀 다운로드
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary.to_excel(writer, sheet_name="요약", index=False)
+        df.to_excel(writer, sheet_name="상세", index=False)
+
+    st.download_button(
+        "📥 엑셀 다운로드",
+        data=output.getvalue(),
+        file_name="정산결과.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
