@@ -1,4 +1,4 @@
-def aggregate(results):
+def aggregate(results, folder_materials):
     summary = {}
 
     for r in results:
@@ -14,21 +14,15 @@ def aggregate(results):
                 "바인더": 0
             }
 
-        # 인쇄 페이지 합산
         if r.get("print_type") == "흑백":
             summary[folder]["흑백"] += r.get("pages", 0)
 
         if r.get("print_type") == "컬러":
             summary[folder]["컬러"] += r.get("pages", 0)
 
-        # 자재 합산 (안전 처리)
-        for m, v in r.get("materials", {}).items():
-            key = m.upper() if m.lower() in ["usb", "cd"] else m
-
-            if key not in summary[folder]:
-                # 신규 자재는 무시하거나 로그용으로만 남김
-                continue
-
-            summary[folder][key] += v
+    # 🔥 자재는 폴더 기준으로 1회 세팅
+    for folder, mats in folder_materials.items():
+        for k, v in mats.items():
+            summary[folder][k] = v
 
     return summary
