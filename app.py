@@ -1,13 +1,23 @@
 import streamlit as st
 import zipfile, os, io, re, math
-from pypdf import PdfReader
 import pandas as pd
+from pypdf import PdfReader
 
-# ===============================
-# 유틸
-# ===============================
+# =====================
+# 유틸 함수
+# =====================
 
-def extract_pages_per_sheet(text):
+def top_level_folder(path):
+    return path.split('/')[0] if '/' in path else 'ROOT'
+
+def folder_path_text(folder):
+    parts = []
+    while folder:
+        parts.append(os.path.basename(folder))
+        folder = os.path.dirname(folder)
+    return " ".join(parts)
+
+def extract_first_pages_per_sheet(text):
     patterns = [
         r'(\d+)\s*up',
         r'한면\s*(\d+)\s*페이지',
@@ -22,35 +32,38 @@ def extract_pages_per_sheet(text):
 
 def extract_copies(text):
     m = re.search(r'(\d+)\s*(부|장)', text)
-    return int(m.group(1)) if m else None
+    return int(m.group(1)) if m else 1
 
-def is_color(text):
-    return any(k in text for k in ['컬러', '칼라', 'color'])
+def is_color(context):
+    return any(k in context for k in ['컬러', '칼라', 'color'])
 
-def folder_path_text(folder):
-    parts = []
-    while folder:
-        parts.append(os.path.basename(folder))
-        folder = os.path.dirname(folder)
-    return " ".join(parts)
+def is_page_excluded(context):
+    exclude_keywords = [
+        'usb', 'cd', '제작',
+        'binder', 'face', 'spine',
+        'toc', '목차'
+    ]
+    return any(k in context for k in exclude_keywords)
 
-def top_level_folder(path):
-    return path.split('/')[0] if '/' in path else 'ROOT'
+def has_vinyl_pdf(filename):
+    return '비닐내지' in filename
 
-# ===============================
-# Streamlit
-# ===============================
+# =====================
+# Streamlit UI
+# =====================
 
 st.set_page_config(layout="wide")
-st.title("ZIP 인쇄 자동 정산기 (정확도 최우선 v1.1)")
+st.title("ZIP 인쇄 페이지 정산기 (1단계 안정판)")
 
-uploaded_zip = st.file_uploader("ZIP 업로드", type="zip")
+uploaded_zip = st.file_uploader("ZIP 파일 업로드", type="zip")
 
 if uploaded_zip:
+    results = []
+
     with zipfile.ZipFile(uploaded_zip) as z:
         files = [f for f in z.namelist() if not f.endswith('/')]
 
-        # txt 수집
+        # TXT 수집
         folder_txt = {}
         for f in files:
             if f.lower().endswith('.txt'):
@@ -69,8 +82,6 @@ if uploaded_zip:
                 folder = os.path.dirname(folder)
             return " ".join(texts)
 
-        results = []
-
         for f in files:
             if not f.lower().endswith('.pdf'):
                 continue
@@ -79,43 +90,54 @@ if uploaded_zip:
             filename = os.path.basename(f)
             top_folder = top_level_folder(f)
 
+            # context 구성
             context = " ".join([
                 filename.lower(),
                 folder_path_text(folder).lower(),
                 collect_txt(folder)
             ])
 
-            pps = extract_pages_per_sheet(context) or 1
-            copies = extract_copies(context) or 1
-            color = "컬러" if is_color(context) else "흑백"
+            # 페이지 제외 대상
+            if is_page_excluded(context):
+                continue
 
+            # PDF 페이지 수
             with z.open(f) as pf:
                 reader = PdfReader(io.BytesIO(pf.read()))
-                raw = len(reader.pages)
+                raw_pages = len(reader.pages)
 
-            final_pages = math.ceil(raw / pps) * copies
+            # 한면 n페이지 (가장 먼저 발견된 것 1개)
+            pps = (
+                extract_first_pages_per_sheet(filename.lower())
+                or extract_first_pages_per_sheet(folder_path_text(folder).lower())
+                or extract_first_pages_per_sheet(collect_txt(folder))
+                or 1
+            )
+
+            copies = extract_copies(context)
+            final_pages = math.ceil(raw_pages / pps) * copies
 
             results.append({
                 "폴더": top_folder,
                 "파일명": filename,
-                "구분": color,
-                "원본페이지": raw,
+                "구분": "컬러" if is_color(context) else "흑백",
+                "원본페이지": raw_pages,
                 "한면": pps,
                 "부수": copies,
-                "최종페이지": final_pages
+                "최종페이지": final_pages,
+                "비닐": 1 if has_vinyl_pdf(filename) else 0
             })
 
     df = pd.DataFrame(results)
 
     summary = (
-        df.groupby(["폴더", "구분"])["최종페이지"]
+        df.groupby("폴더")[["최종페이지", "비닐"]]
         .sum()
-        .unstack(fill_value=0)
         .reset_index()
     )
 
     st.subheader("📊 폴더별 요약")
     st.dataframe(summary, use_container_width=True)
 
-    st.subheader("📄 상세")
+    st.subheader("📄 상세 내역")
     st.dataframe(df, use_container_width=True)
