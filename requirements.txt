@@ -1,5 +1,6 @@
 streamlit
-pypdf
+pypdf>=3.0
 python-pptx
+pyyaml
 pandas
 openpyxl
