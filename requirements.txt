@@ -1,5 +1,2 @@
 streamlit
 pypdf
-pandas
-openpyxl
-python-pptx
