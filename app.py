@@ -1,138 +1,171 @@
 import streamlit as st
 import zipfile
-import tempfile
 import os
+import io
 import re
+import math
+import pandas as pd
 from pypdf import PdfReader
 
-st.set_page_config(page_title="문서 수량 자동 계산", layout="wide")
+st.set_page_config(page_title="출력물 자동 정산기", layout="wide")
+st.title("📦 ZIP 출력물 자동 정산 (페이지 + 비닐 통합 판단)")
 
-# -----------------------------
-# 유틸
-# -----------------------------
-def read_pdf_pages(path):
-    try:
-        return len(PdfReader(path).pages)
-    except:
+uploaded_zip = st.file_uploader("ZIP 파일 업로드", type=["zip"])
+
+# ---------------------------
+# 유틸 함수
+# ---------------------------
+
+def normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower())
+
+def extract_vinyl_qty(text: str) -> int:
+    """
+    비닐/비닐내지 수량 추출
+    규칙:
+    - 비닐 키워드 없으면 0
+    - 숫자 있으면 그 숫자
+    - 숫자 없으면 1
+    - (3공)의 3은 무시
+    """
+    if "비닐" not in text:
         return 0
 
-def read_txt(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except:
-        return ""
+    # 장 / 개 와 붙은 숫자 우선
+    nums = re.findall(r"(\d+)\s*(?:장|개)", text)
+    if nums:
+        return sum(int(n) for n in nums)
 
-def extract_n_up(text):
+    # 그 외 숫자 (단, 3공 제외)
+    nums = re.findall(r"\d+", text)
+    filtered = [int(n) for n in nums if int(n) != 3]
+    if filtered:
+        return max(filtered)
+
+    return 1
+
+def extract_up_divisor(text: str) -> int:
+    """
+    한면 n페이지 / nup / n페이지씩 → n
+    없으면 1
+    """
     patterns = [
-        r"한면\s*(\d+)\s*페이지",
         r"(\d+)\s*up",
-        r"한면\s*(\d+)",
+        r"한면\s*(\d+)\s*페이지",
+        r"1면\s*(\d+)\s*페이지",
+        r"(\d+)\s*페이지씩"
     ]
     for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
+        m = re.search(p, text)
         if m:
             return int(m.group(1))
     return 1
 
-def extract_vinyl(text):
-    m = re.search(r"비닐내지.*?(\d+)", text)
-    if m:
-        return int(m.group(1))
-    if "비닐내지" in text:
-        return 1
-    return 0
+def is_page_excluded(text: str) -> bool:
+    """
+    페이지 계산 제외 조건
+    """
+    exclude_keywords = [
+        "비닐만",
+        "비닐내지만",
+        "출력없음",
+        "페이지 계산 안함"
+    ]
+    return any(k in text for k in exclude_keywords)
 
-def is_usb(text):
-    return any(k in text.lower() for k in ["usb", "전자파일"])
+# ---------------------------
+# 메인 처리
+# ---------------------------
 
-def is_page_excluded(text, pages):
-    # 6페이지 이하 + TOC/표지 계열이면 제외
-    if pages <= 6:
-        if any(k in text.lower() for k in ["toc", "table of contents", "표지", "index"]):
-            return True
-    return False
+if uploaded_zip:
+    summary = {}
+    details = []
 
-# -----------------------------
-# 메인
-# -----------------------------
-st.title("📦 문서 출력 수량 자동 계산 (최종 안정화)")
+    with zipfile.ZipFile(uploaded_zip, "r") as z:
+        all_files = [f for f in z.namelist() if not f.endswith("/")]
 
-uploaded = st.file_uploader("ZIP 업로드", type=["zip"])
+        # TXT 내용 미리 읽기
+        txt_contents = {}
+        for f in all_files:
+            if f.lower().endswith(".txt"):
+                with z.open(f) as tf:
+                    try:
+                        txt_contents[os.path.dirname(f)] = normalize(
+                            tf.read().decode("utf-8", errors="ignore")
+                        )
+                    except:
+                        txt_contents[os.path.dirname(f)] = ""
 
-if uploaded:
-    tmpdir = tempfile.mkdtemp()
-
-    with zipfile.ZipFile(uploaded, "r") as z:
-        z.extractall(tmpdir)
-
-    result = {}
-
-    for root, dirs, files in os.walk(tmpdir):
-        for file in files:
-            path = os.path.join(root, file)
-            upper = os.path.relpath(root, tmpdir).split(os.sep)[0]
-
-            if upper not in result:
-                result[upper] = {
-                    "흑백": 0,
-                    "컬러": 0,
-                    "비닐": 0,
-                    "USB": 0
-                }
-
-            name = file.lower()
-
-            # TXT 먼저
-            if file.lower().endswith(".txt"):
-                txt = read_txt(path)
-
-                if is_usb(txt):
-                    result[upper]["USB"] += 1
-                    continue
-
-                vinyl = extract_vinyl(txt)
-                result[upper]["비닐"] += vinyl
+        for f in all_files:
+            if not f.lower().endswith(".pdf"):
                 continue
 
-            # PDF
-            if file.lower().endswith(".pdf"):
-                pages = read_pdf_pages(path)
-                text = file.lower()
+            top_folder = f.split("/")[0]
+            folder = os.path.dirname(f)
+            filename = os.path.basename(f)
 
-                # USB 제작이면 페이지 제외
-                if is_usb(text):
-                    result[upper]["USB"] += 1
-                    continue
+            if top_folder not in summary:
+                summary[top_folder] = {
+                    "흑백페이지": 0,
+                    "비닐": 0
+                }
 
-                # 비닐내지만 있는 파일
-                if "비닐내지" in text and pages <= 1:
-                    result[upper]["비닐"] += 1
-                    continue
+            # ---------------------------
+            # 1️⃣ 텍스트 수집
+            # ---------------------------
+            texts = [
+                normalize(filename),
+                normalize(folder),
+                txt_contents.get(folder, "")
+            ]
+            full_text = " ".join(texts)
 
-                # 제외 판단
-                if is_page_excluded(text, pages):
-                    continue
+            # ---------------------------
+            # 2️⃣ 비닐 판단
+            # ---------------------------
+            vinyl_qty = extract_vinyl_qty(full_text)
+            summary[top_folder]["비닐"] += vinyl_qty
 
-                n_up = extract_n_up(text)
-                sheets = (pages + n_up - 1) // n_up
+            # ---------------------------
+            # 3️⃣ 페이지 계산 여부
+            # ---------------------------
+            if is_page_excluded(full_text):
+                page_count = 0
+            else:
+                with z.open(f) as pdf_file:
+                    reader = PdfReader(io.BytesIO(pdf_file.read()))
+                    raw_pages = len(reader.pages)
 
-                # 컬러/흑백
-                if "컬러" in text:
-                    result[upper]["컬러"] += sheets
-                else:
-                    result[upper]["흑백"] += sheets
+                up = extract_up_divisor(full_text)
+                page_count = math.ceil(raw_pages / up)
 
-    st.subheader("📊 결과")
+            summary[top_folder]["흑백페이지"] += page_count
 
-    rows = []
-    for k, v in result.items():
-        rows.append({
-            "폴더": k,
-            "흑백": v["흑백"],
-            "컬러": v["컬러"],
-            "비닐": v["비닐"],
-            "USB": v["USB"]
-        })
+            details.append({
+                "상위폴더": top_folder,
+                "파일명": filename,
+                "원본페이지": raw_pages if page_count else 0,
+                "UP": up if page_count else "-",
+                "최종페이지": page_count,
+                "비닐": vinyl_qty
+            })
 
-    st.dataframe(rows, use_container_width=True)
+    df_summary = pd.DataFrame(summary).T.reset_index().rename(columns={"index": "폴더"})
+    df_detail = pd.DataFrame(details)
+
+    st.subheader("📊 폴더별 요약")
+    st.dataframe(df_summary, use_container_width=True)
+
+    st.subheader("📄 상세 내역")
+    st.dataframe(df_detail, use_container_width=True)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_summary.to_excel(writer, sheet_name="요약", index=False)
+        df_detail.to_excel(writer, sheet_name="상세", index=False)
+
+    st.download_button(
+        "📥 엑셀 다운로드",
+        data=output.getvalue(),
+        file_name="정산결과.xlsx"
+    )
