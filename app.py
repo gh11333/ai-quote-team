@@ -1,171 +1,164 @@
-import streamlit as st
-import zipfile
 import os
-import io
 import re
-import math
-import pandas as pd
-from pypdf import PdfReader
+from PyPDF2 import PdfReader
 
-st.set_page_config(page_title="출력물 자동 정산기", layout="wide")
-st.title("📦 ZIP 출력물 자동 정산 (페이지 + 비닐 통합 판단)")
+# =========================
+# 공통 유틸
+# =========================
 
-uploaded_zip = st.file_uploader("ZIP 파일 업로드", type=["zip"])
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except:
+        return default
 
-# ---------------------------
-# 유틸 함수
-# ---------------------------
 
-def normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", text.lower())
+# =========================
+# 비닐 계산 (최종 안정화)
+# =========================
 
-def extract_vinyl_qty(text: str) -> int:
+def extract_vinyl_count(text: str) -> int:
     """
-    비닐/비닐내지 수량 추출
-    규칙:
-    - 비닐 키워드 없으면 0
-    - 숫자 있으면 그 숫자
-    - 숫자 없으면 1
-    - (3공)의 3은 무시
+    비닐 계산 규칙 (최종본)
+    1. '비닐' / '비닐내지'가 없으면 0
+    2. 키워드 기준 ±10글자 내 숫자만 인정
+    3. 1~200 범위만 유효
+    4. 숫자 없으면 비닐 = 1
     """
+
+    if not text:
+        return 0
+
+    text = text.lower()
+
     if "비닐" not in text:
         return 0
 
-    # 장 / 개 와 붙은 숫자 우선
-    nums = re.findall(r"(\d+)\s*(?:장|개)", text)
-    if nums:
-        return sum(int(n) for n in nums)
+    pattern = r"(비닐내지|비닐).{0,10}?(\d{1,3})"
+    matches = re.findall(pattern, text)
 
-    # 그 외 숫자 (단, 3공 제외)
-    nums = re.findall(r"\d+", text)
-    filtered = [int(n) for n in nums if int(n) != 3]
-    if filtered:
-        return max(filtered)
+    valid = []
+    for _, num in matches:
+        n = safe_int(num)
+        if 1 <= n <= 200:
+            valid.append(n)
+
+    if valid:
+        return max(valid)
 
     return 1
 
-def extract_up_divisor(text: str) -> int:
+
+# =========================
+# 페이지 계산
+# =========================
+
+def calculate_pdf_pages(pdf_path: str) -> int:
+    try:
+        reader = PdfReader(pdf_path)
+        return len(reader.pages)
+    except:
+        return 0
+
+
+def extract_page_rule_from_text(text: str):
     """
-    한면 n페이지 / nup / n페이지씩 → n
-    없으면 1
+    출력 규칙 파싱
+    단면 / 양면
+    1면에 2페이지 / 4페이지
     """
-    patterns = [
-        r"(\d+)\s*up",
-        r"한면\s*(\d+)\s*페이지",
-        r"1면\s*(\d+)\s*페이지",
-        r"(\d+)\s*페이지씩"
-    ]
-    for p in patterns:
-        m = re.search(p, text)
-        if m:
-            return int(m.group(1))
-    return 1
+    text = text.lower()
 
-def is_page_excluded(text: str) -> bool:
-    """
-    페이지 계산 제외 조건
-    """
-    exclude_keywords = [
-        "비닐만",
-        "비닐내지만",
-        "출력없음",
-        "페이지 계산 안함"
-    ]
-    return any(k in text for k in exclude_keywords)
+    is_duplex = "양면" in text
+    per_side = 1
 
-# ---------------------------
-# 메인 처리
-# ---------------------------
+    if "1면에2페이지" in text or "한면2페이지" in text:
+        per_side = 2
+    elif "1면에4페이지" in text or "한면4페이지" in text:
+        per_side = 4
 
-if uploaded_zip:
-    summary = {}
-    details = []
+    return is_duplex, per_side
 
-    with zipfile.ZipFile(uploaded_zip, "r") as z:
-        all_files = [f for f in z.namelist() if not f.endswith("/")]
 
-        # TXT 내용 미리 읽기
-        txt_contents = {}
-        for f in all_files:
-            if f.lower().endswith(".txt"):
-                with z.open(f) as tf:
-                    try:
-                        txt_contents[os.path.dirname(f)] = normalize(
-                            tf.read().decode("utf-8", errors="ignore")
-                        )
-                    except:
-                        txt_contents[os.path.dirname(f)] = ""
+def calculate_printed_pages(original_pages, is_duplex, per_side):
+    if per_side <= 0:
+        return original_pages
 
-        for f in all_files:
-            if not f.lower().endswith(".pdf"):
-                continue
+    logical_pages = original_pages / per_side
 
-            top_folder = f.split("/")[0]
-            folder = os.path.dirname(f)
-            filename = os.path.basename(f)
+    if is_duplex:
+        return int((logical_pages + 1) // 2)
+    else:
+        return int(logical_pages)
 
-            if top_folder not in summary:
-                summary[top_folder] = {
-                    "흑백페이지": 0,
-                    "비닐": 0
-                }
 
-            # ---------------------------
-            # 1️⃣ 텍스트 수집
-            # ---------------------------
-            texts = [
-                normalize(filename),
-                normalize(folder),
-                txt_contents.get(folder, "")
-            ]
-            full_text = " ".join(texts)
+# =========================
+# 단일 파일 처리
+# =========================
 
-            # ---------------------------
-            # 2️⃣ 비닐 판단
-            # ---------------------------
-            vinyl_qty = extract_vinyl_qty(full_text)
-            summary[top_folder]["비닐"] += vinyl_qty
+def process_file(file_path: str):
+    filename = os.path.basename(file_path)
+    ext = os.path.splitext(filename)[1].lower()
 
-            # ---------------------------
-            # 3️⃣ 페이지 계산 여부
-            # ---------------------------
-            if is_page_excluded(full_text):
-                page_count = 0
-            else:
-                with z.open(f) as pdf_file:
-                    reader = PdfReader(io.BytesIO(pdf_file.read()))
-                    raw_pages = len(reader.pages)
+    vinyl = 0
+    bw_pages = 0
 
-                up = extract_up_divisor(full_text)
-                page_count = math.ceil(raw_pages / up)
+    # TXT 먼저 읽기
+    txt_content = ""
+    if ext == ".txt":
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                txt_content = f.read()
+        except:
+            pass
 
-            summary[top_folder]["흑백페이지"] += page_count
+    # 비닐 계산 (TXT + 파일명)
+    vinyl += extract_vinyl_count(txt_content)
+    vinyl += extract_vinyl_count(filename)
 
-            details.append({
-                "상위폴더": top_folder,
-                "파일명": filename,
-                "원본페이지": raw_pages if page_count else 0,
-                "UP": up if page_count else "-",
-                "최종페이지": page_count,
-                "비닐": vinyl_qty
-            })
+    # PDF 페이지 계산
+    if ext == ".pdf":
+        original_pages = calculate_pdf_pages(file_path)
+        rule_text = filename + " " + txt_content
+        is_duplex, per_side = extract_page_rule_from_text(rule_text)
+        bw_pages = calculate_printed_pages(original_pages, is_duplex, per_side)
 
-    df_summary = pd.DataFrame(summary).T.reset_index().rename(columns={"index": "폴더"})
-    df_detail = pd.DataFrame(details)
+    return bw_pages, vinyl
 
-    st.subheader("📊 폴더별 요약")
-    st.dataframe(df_summary, use_container_width=True)
 
-    st.subheader("📄 상세 내역")
-    st.dataframe(df_detail, use_container_width=True)
+# =========================
+# 폴더 단위 집계
+# =========================
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_summary.to_excel(writer, sheet_name="요약", index=False)
-        df_detail.to_excel(writer, sheet_name="상세", index=False)
+def process_folder(root_folder: str):
+    result = {}
 
-    st.download_button(
-        "📥 엑셀 다운로드",
-        data=output.getvalue(),
-        file_name="정산결과.xlsx"
-    )
+    for root, dirs, files in os.walk(root_folder):
+        folder_name = os.path.basename(root)
+        if folder_name not in result:
+            result[folder_name] = {"흑백": 0, "비닐": 0}
+
+        for file in files:
+            file_path = os.path.join(root, file)
+            bw, vinyl = process_file(file_path)
+            result[folder_name]["흑백"] += bw
+            result[folder_name]["비닐"] += vinyl
+
+    return result
+
+
+# =========================
+# 실행부
+# =========================
+
+if __name__ == "__main__":
+    TARGET_FOLDER = "./data"  # ← 여기만 네 폴더 경로로 수정
+
+    summary = process_folder(TARGET_FOLDER)
+
+    print("\n📊 정산 결과")
+    print("-" * 40)
+    for folder, values in summary.items():
+        print(
+            f"{folder}\t흑백 {values['흑백']}\t비닐 {values['비닐']}"
+        )
