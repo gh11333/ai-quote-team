@@ -1,2 +1,2 @@
 streamlit
-PyPDF2
+pypdf>=3.0.0
